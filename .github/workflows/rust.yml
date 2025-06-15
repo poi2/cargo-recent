@@ -1,0 +1,151 @@
+name: "Test"
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  test_on_stable:
+    name: Rust test on stable
+    runs-on: ${{matrix.os}}-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu, macos, windows]
+    timeout-minutes: 45
+    steps:
+      # Prepare
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: rustc --version
+
+      # Ensure git is installed and configured
+      - name: Install and configure git (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          if ! command -v git &> /dev/null; then
+            echo "Git not found, installing..."
+            if [ "$RUNNER_OS" == "Linux" ]; then
+              sudo apt-get update
+              sudo apt-get install -y git
+            elif [ "$RUNNER_OS" == "macOS" ]; then
+              brew install git
+            fi
+          fi
+          git --version
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Install and configure git (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            Write-Host "Git not found, installing..."
+            choco install git -y
+          }
+          git --version
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      # Check compilation
+      - name: Run cargo check
+        run: cargo check --release --workspace --all-features
+
+      # Check lints
+      - name: Run cargo clippy
+        run: |
+          cargo clippy --version
+          cargo clippy --all-targets --all-features -- -D warnings --no-deps
+
+      # Check dependencies order
+      # Run only on Ubuntu to ensure compatibility.
+      - name: Install cargo-sort
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-sort
+        if: matrix.os == 'ubuntu'
+      - name: Run cargo sort
+        run: cargo sort --check --workspace --grouped
+        if: matrix.os == 'ubuntu'
+
+      # Check formatting
+      - name: Run cargo fmt
+        run: |
+          cargo fmt --version
+          cargo fmt --all --check --message-format human
+
+      # Run tests (including ignored tests)
+      - name: Run tests with all features
+        run: cargo test --all-features -- --ignored
+
+      # Run integration tests
+      - name: Setup test repository for integration tests
+        run: |
+          mkdir -p test-repo
+          cd test-repo
+          git init
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          mkdir -p test-crate/src
+          echo '[package]
+          name = "test-crate"
+          version = "0.1.0"
+          edition = "2021"' > test-crate/Cargo.toml
+          echo 'fn main() {
+              println!("Hello, world!");
+          }' > test-crate/src/main.rs
+          git add .
+          git commit -m "Initial commit"
+          cd ..
+          echo "CI_TEST_REPO=$(pwd)/test-repo" >> $GITHUB_ENV
+
+      # Install cargo-recent for integration tests
+      - name: Install cargo-recent
+        run: cargo install --path .
+
+      # Run shell script integration test
+      - name: Run shell script integration test (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x tests/integration.sh
+          ./tests/integration.sh
+
+      - name: Run shell script integration test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          chmod +x tests/integration.sh
+          ./tests/integration.sh
+
+      # - name: Run tests for documentation
+      #   run: cargo test --doc
+
+  test_on_nightly:
+    name: Rust test on nightly
+    needs: test_on_stable
+    runs-on: ${{matrix.os}}-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu]
+    steps:
+      # Prepare
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+      - run: rustc --version
+
+      # Check unused dependencies
+      - name: Install cargo-udeps
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-udeps
+      - name: Run cargo +nightly udeps
+        run: cargo +nightly udeps --release --workspace --all-targets --all-features
