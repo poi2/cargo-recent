@@ -10,6 +10,9 @@ readme = "README.md"
 keywords = ["cargo", "subcommand", "workspace", "development", "tool"]
 categories = ["development-tools::cargo-plugins", "command-line-utilities"]
 
+[features]
+dbg = []
+
 [dependencies]
 anyhow = "1.0"
 chrono = "0.4"

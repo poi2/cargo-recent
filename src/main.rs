@@ -7,6 +7,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
+// Macro for outputting debug logs
+// Only compiled when the dbg feature is enabled
+#[cfg(feature = "dbg")]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        eprintln!("Debug: {}", format!($($arg)*));
+    };
+}
+
+// Does nothing when the dbg feature is disabled
+#[cfg(not(feature = "dbg"))]
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        // Do nothing
+    };
+}
+
 #[derive(Parser)]
 #[command(name = "cargo-recent")]
 #[command(bin_name = "cargo")]
@@ -35,6 +52,10 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    // Print debug information about the environment
+    debug_log!("Current directory: {:?}", std::env::current_dir()?);
+    debug_log!("Args: {:?}", std::env::args().collect::<Vec<_>>());
+
     let Cli::Recent(args) = Cli::parse();
 
     match args.command {
@@ -102,20 +123,37 @@ fn main() -> Result<()> {
 
 /// Find the path of the recently changed crate
 fn find_recent_crate_path() -> Result<PathBuf> {
+    debug_log!("Entering find_recent_crate_path");
+
+    // First, try to find the repository root
+    let repo_root =
+        find_repo_root().ok_or_else(|| anyhow!("Could not find git repository root"))?;
+
+    debug_log!("Repository root: {}", repo_root.display());
+
     // Get git diff to find changed files (uncommitted changes only)
     let output = Command::new("git")
         .args(["diff", "--name-only"])
+        .current_dir(&repo_root) // Ensure we run git diff from the repository root
         .output()
         .context("Failed to execute git diff command")?;
 
     if !output.status.success() {
+        debug_log!("Git diff command failed with status: {:?}", output.status);
+        debug_log!(
+            "Git diff stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         return Err(anyhow!("Git diff command failed"));
     }
 
     let diff_output =
         String::from_utf8(output.stdout).context("Failed to parse git diff output")?;
 
+    debug_log!("Git diff output: {:?}", diff_output);
+
     if diff_output.trim().is_empty() {
+        debug_log!("No changes detected");
         // Return empty path instead of error when no changes are detected
         return Ok(PathBuf::new());
     }
@@ -125,19 +163,28 @@ fn find_recent_crate_path() -> Result<PathBuf> {
     let mut latest_file: Option<PathBuf> = None;
 
     for file in diff_output.lines() {
-        let file_path = Path::new(file);
+        debug_log!("Processing file from git diff: {}", file);
+
+        // Convert the relative path from git diff to an absolute path
+        let file_path = repo_root.join(file);
+        debug_log!("Absolute file path: {}", file_path.display());
+
         if file_path.exists() {
-            if let Ok(metadata) = fs::metadata(file_path) {
+            debug_log!("File exists");
+            if let Ok(metadata) = fs::metadata(&file_path) {
+                debug_log!("Got metadata for file");
                 if let Ok(modified) = metadata.modified() {
                     let modified_time: DateTime<Local> = modified.into();
+                    debug_log!("File modified time: {}", modified_time);
                     if modified_time > latest_time {
+                        debug_log!("New latest file: {}", file_path.display());
                         latest_time = modified_time;
-                        latest_file = Some(file_path.to_path_buf());
+                        latest_file = Some(file_path);
                     } else if modified_time == latest_time && latest_file.is_some() {
                         // Tiebreak by filename (ASC sort)
                         if let Some(ref current_latest) = latest_file {
                             if file_path.to_string_lossy() < current_latest.to_string_lossy() {
-                                latest_file = Some(file_path.to_path_buf());
+                                latest_file = Some(file_path);
                             }
                         }
                     }
@@ -146,15 +193,131 @@ fn find_recent_crate_path() -> Result<PathBuf> {
         }
     }
 
-    let latest_file = latest_file.ok_or_else(|| anyhow!("No valid changed files found"))?;
+    let latest_file = match latest_file {
+        Some(file) => file,
+        None => {
+            debug_log!("No valid changed files found");
+            return Err(anyhow!("No valid changed files found"));
+        }
+    };
+
+    debug_log!("Latest file: {}", latest_file.display());
 
     // Find the crate directory containing this file
-    find_crate_directory(&latest_file)
+    let crate_dir = find_crate_directory(&latest_file)?;
+    debug_log!("Crate directory: {}", crate_dir.display());
+
+    Ok(crate_dir)
+}
+
+/// Find the Git repository root directory
+fn find_repo_root() -> Option<PathBuf> {
+    let mut current = std::env::current_dir().ok()?;
+
+    // Traverse up until we find a .git directory
+    loop {
+        let git_dir = current.join(".git");
+        if git_dir.exists() && git_dir.is_dir() {
+            return Some(current);
+        }
+
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            // Reached the root of the filesystem without finding .git
+            return None;
+        }
+    }
 }
 
 /// Find the crate directory containing the given file
 fn find_crate_directory(file_path: &Path) -> Result<PathBuf> {
-    // First, check if the current directory has a Cargo.toml file
+    debug_log!("Finding crate directory for file: {}", file_path.display());
+
+    // First, try to find the repository root
+    if let Some(repo_root) = find_repo_root() {
+        debug_log!("Repository root found: {}", repo_root.display());
+        // Check if the repository root has a Cargo.toml file
+        let root_cargo_toml = repo_root.join("Cargo.toml");
+        if root_cargo_toml.exists() {
+            // Check if this is a workspace by looking for [workspace] in Cargo.toml
+            let cargo_content =
+                fs::read_to_string(&root_cargo_toml).context("Failed to read root Cargo.toml")?;
+
+            if cargo_content.contains("[workspace]") {
+                debug_log!("Workspace detected");
+
+                // For workspace, we need to find the specific crate containing the file
+                // Get the absolute path of the file
+                let abs_file_path = if file_path.is_absolute() {
+                    file_path.to_path_buf()
+                } else {
+                    std::env::current_dir()?.join(file_path)
+                };
+
+                debug_log!("Absolute file path: {}", abs_file_path.display());
+
+                // Look for crates in subdirectories
+                for entry in WalkDir::new(&repo_root)
+                    .max_depth(3) // Limit depth to avoid excessive searching
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_file() && e.file_name() == "Cargo.toml")
+                {
+                    let dir = entry
+                        .path()
+                        .parent()
+                        .unwrap_or(Path::new("."))
+                        .to_path_buf();
+
+                    // Skip the root Cargo.toml
+                    if dir == repo_root {
+                        continue;
+                    }
+
+                    // Check if the file is within this crate directory
+                    let abs_dir = if dir.is_absolute() {
+                        dir.clone()
+                    } else {
+                        repo_root.join(&dir)
+                    };
+
+                    // Convert to canonical paths to handle symlinks and relative paths
+                    let canonical_file = abs_file_path.canonicalize().ok();
+                    let canonical_dir = abs_dir.canonicalize().ok();
+
+                    if let (Some(file), Some(dir)) =
+                        (canonical_file.as_ref(), canonical_dir.as_ref())
+                    {
+                        debug_log!(
+                            "Checking if {} starts with {}",
+                            file.display(),
+                            dir.display()
+                        );
+                        if file.starts_with(dir) {
+                            debug_log!("Found matching crate directory: {}", dir.display());
+                            return Ok(dir.to_path_buf());
+                        }
+                    }
+                }
+
+                debug_log!(
+                    "No specific crate found, returning workspace root: {}",
+                    repo_root.display()
+                );
+                // If we couldn't find a specific crate, return the workspace root
+                return Ok(repo_root);
+            } else {
+                // If it's not a workspace but has a Cargo.toml, use the repository root
+                return Ok(repo_root);
+            }
+        }
+    }
+
+    // Fallback to the original implementation if we couldn't find the repository root
+    // or if the repository root doesn't have a Cargo.toml file
+
+    // Check if the current directory has a Cargo.toml file
     let current_dir = Path::new(".");
     let current_cargo_toml = current_dir.join("Cargo.toml");
     if current_cargo_toml.exists() {
@@ -192,10 +355,33 @@ fn find_crate_directory(file_path: &Path) -> Result<PathBuf> {
                 .filter(|e| e.file_type().is_file() && e.file_name() == "Cargo.toml")
             {
                 let dir = entry.path().parent().unwrap_or(Path::new("."));
-                let rel_path = file_path.strip_prefix(dir).ok();
 
-                if rel_path.is_some() && !rel_path.unwrap().as_os_str().is_empty() {
-                    return Ok(dir.to_path_buf());
+                // Skip the root Cargo.toml
+                if dir == Path::new(".") {
+                    continue;
+                }
+
+                // Get the absolute path of the file and directory
+                let abs_file_path = if file_path.is_absolute() {
+                    file_path.to_path_buf()
+                } else {
+                    std::env::current_dir()?.join(file_path)
+                };
+
+                let abs_dir = if dir.is_absolute() {
+                    dir.to_path_buf()
+                } else {
+                    std::env::current_dir()?.join(dir)
+                };
+
+                // Convert to canonical paths to handle symlinks and relative paths
+                let canonical_file = abs_file_path.canonicalize().ok();
+                let canonical_dir = abs_dir.canonicalize().ok();
+
+                if let (Some(file), Some(dir)) = (canonical_file, canonical_dir) {
+                    if file.starts_with(&dir) {
+                        return Ok(dir);
+                    }
                 }
             }
         }
