@@ -2,7 +2,16 @@ name: "Test"
 on:
   push:
     branches: ["main"]
+    paths: &common_paths
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Makefile.toml"
+      - ".github/workflows/rust.yml"
   pull_request:
+    paths:
+      - *common_paths
   schedule:
     - cron: "0 0 * * *"
 
