@@ -93,19 +93,37 @@ fn main() -> Result<()> {
             // Create the command
             let mut cmd = Command::new("cargo");
 
-            // Add all subcommands first
-            for arg in &args {
+            // Split args at "--" if present
+            let dash_dash_pos = args.iter().position(|arg| arg == "--");
+
+            // Add subcommands before "--"
+            let (before_dash, after_dash) = if let Some(pos) = dash_dash_pos {
+                (&args[0..pos], &args[pos + 1..])
+            } else {
+                (&args[..], &[] as &[String])
+            };
+
+            // Add subcommands before "--"
+            for arg in before_dash {
                 cmd.arg(arg);
             }
 
             // Then add the package flag
             cmd.arg("--package").arg(&crate_name);
 
+            // Add "--" and args after "--" if any
+            if !after_dash.is_empty() {
+                cmd.arg("--");
+                for arg in after_dash {
+                    cmd.arg(arg);
+                }
+            }
+
             // Print the command being executed
             let mut command_str = "run: cargo".to_string();
 
-            // Add all subcommands first
-            for arg in &args {
+            // Add subcommands before "--"
+            for arg in before_dash {
                 command_str.push(' ');
                 command_str.push_str(arg);
             }
@@ -113,6 +131,15 @@ fn main() -> Result<()> {
             // Then add the package flag
             command_str.push_str(" --package ");
             command_str.push_str(&crate_name);
+
+            // Add "--" and args after "--" if any
+            if !after_dash.is_empty() {
+                command_str.push_str(" --");
+                for arg in after_dash {
+                    command_str.push(' ');
+                    command_str.push_str(arg);
+                }
+            }
 
             println!("{}", command_str);
 
