@@ -2,9 +2,11 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use regex::Regex;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 // Macro for outputting debug logs
 // Only compiled when the dbg feature is enabled
@@ -120,7 +122,7 @@ fn main() -> Result<()> {
             }
 
             // Print the command being executed
-            let mut command_str = "run: cargo".to_string();
+            let mut command_str = "Executing cargo command:".to_string();
 
             // Add subcommands before "--"
             for arg in before_dash {
@@ -145,7 +147,6 @@ fn main() -> Result<()> {
 
             // Set stdout and stderr to inherit from the parent process
             // This preserves color output and other terminal features
-            use std::process::Stdio;
             cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
             // Execute the command and wait for it to complete
@@ -154,7 +155,13 @@ fn main() -> Result<()> {
                 .with_context(|| "Failed to execute command".to_string())?;
 
             if !status.success() {
-                return Err(anyhow!("Command failed"));
+                return Err(anyhow!(
+                    "Command failed with status: {}. Command: {}",
+                    status
+                        .code()
+                        .map_or("unknown".to_string(), |c| c.to_string()),
+                    command_str
+                ));
             }
         }
         None => {
@@ -210,8 +217,11 @@ fn find_recent_crate_path() -> Result<PathBuf> {
         debug_log!("Processing file from git diff: {}", file);
 
         // Check if the file is a Rust file (.rs) or Cargo file (Cargo.toml, Cargo.lock)
-        let is_rust_file = file.ends_with(".rs");
-        let is_cargo_file = file.ends_with("Cargo.toml") || file.ends_with("Cargo.lock");
+        let file_path = Path::new(file);
+        let is_rust_file = file_path.extension().is_some_and(|ext| ext == "rs");
+        let is_cargo_file = file_path
+            .file_name()
+            .is_some_and(|name| name == "Cargo.toml" || name == "Cargo.lock");
 
         if !is_rust_file && !is_cargo_file {
             debug_log!("Skipping non-Rust/Cargo file: {}", file);
@@ -303,7 +313,7 @@ fn find_crate_directory(file_path: &Path) -> Result<PathBuf> {
     let mut repo_root: Option<PathBuf> = None;
 
     // Traverse up until we find a directory with a Cargo.toml file or reach the filesystem root
-    while current != Path::new("") && current != Path::new("/") {
+    while let Some(parent) = current.parent() {
         debug_log!("Checking directory: {}", current.display());
 
         // Check if this directory has a Cargo.toml
@@ -340,11 +350,7 @@ fn find_crate_directory(file_path: &Path) -> Result<PathBuf> {
         }
 
         // Move to the parent directory
-        if let Some(parent) = current.parent() {
-            current = parent;
-        } else {
-            break;
-        }
+        current = parent;
     }
 
     // If we found a repository root with a workspace, try to find the specific crate
@@ -365,18 +371,18 @@ fn find_crate_directory(file_path: &Path) -> Result<PathBuf> {
                 // by traversing up from the file's directory
                 let mut current = abs_file_path.parent().unwrap_or(Path::new("/"));
 
-                while current != Path::new("") && current != Path::new("/") && current != root {
+                while let Some(parent) = current.parent() {
+                    if current == root {
+                        break;
+                    }
+
                     let cargo_toml = current.join("Cargo.toml");
                     if cargo_toml.exists() {
                         debug_log!("Found subcrate Cargo.toml at: {}", cargo_toml.display());
                         return Ok(current.to_path_buf());
                     }
 
-                    if let Some(parent) = current.parent() {
-                        current = parent;
-                    } else {
-                        break;
-                    }
+                    current = parent;
                 }
 
                 // If we couldn't find a specific crate by traversing up,
