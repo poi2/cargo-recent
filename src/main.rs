@@ -5,7 +5,6 @@ use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use walkdir::WalkDir;
 
 // Macro for outputting debug logs
 // Only compiled when the dbg feature is enabled
@@ -91,26 +90,44 @@ fn main() -> Result<()> {
             }
             let crate_name = get_crate_name(&crate_path)?;
 
-            let cargo_cmd = &args[0];
+            // Create the command
             let mut cmd = Command::new("cargo");
-            cmd.arg(cargo_cmd).arg("--package").arg(crate_name);
 
-            // Add any additional arguments
-            if args.len() > 1 {
-                cmd.args(&args[1..]);
+            // Add all subcommands first
+            for arg in &args {
+                cmd.arg(arg);
             }
 
-            let output = cmd
-                .output()
-                .with_context(|| format!("Failed to execute cargo {}", cargo_cmd))?;
+            // Then add the package flag
+            cmd.arg("--package").arg(&crate_name);
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow!(
-                    "Command 'cargo {}' failed with error: {}",
-                    cargo_cmd,
-                    stderr
-                ));
+            // Print the command being executed
+            let mut command_str = "run: cargo".to_string();
+
+            // Add all subcommands first
+            for arg in &args {
+                command_str.push(' ');
+                command_str.push_str(arg);
+            }
+
+            // Then add the package flag
+            command_str.push_str(" --package ");
+            command_str.push_str(&crate_name);
+
+            println!("{}", command_str);
+
+            // Set stdout and stderr to inherit from the parent process
+            // This preserves color output and other terminal features
+            use std::process::Stdio;
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
+            // Execute the command and wait for it to complete
+            let status = cmd
+                .status()
+                .with_context(|| "Failed to execute command".to_string())?;
+
+            if !status.success() {
+                return Err(anyhow!("Command failed"));
             }
         }
         None => {
@@ -164,6 +181,15 @@ fn find_recent_crate_path() -> Result<PathBuf> {
 
     for file in diff_output.lines() {
         debug_log!("Processing file from git diff: {}", file);
+
+        // Check if the file is a Rust file (.rs) or Cargo file (Cargo.toml, Cargo.lock)
+        let is_rust_file = file.ends_with(".rs");
+        let is_cargo_file = file.ends_with("Cargo.toml") || file.ends_with("Cargo.lock");
+
+        if !is_rust_file && !is_cargo_file {
+            debug_log!("Skipping non-Rust/Cargo file: {}", file);
+            continue;
+        }
 
         // Convert the relative path from git diff to an absolute path
         let file_path = repo_root.join(file);
@@ -234,160 +260,122 @@ fn find_repo_root() -> Option<PathBuf> {
 fn find_crate_directory(file_path: &Path) -> Result<PathBuf> {
     debug_log!("Finding crate directory for file: {}", file_path.display());
 
-    // First, try to find the repository root
-    if let Some(repo_root) = find_repo_root() {
-        debug_log!("Repository root found: {}", repo_root.display());
-        // Check if the repository root has a Cargo.toml file
-        let root_cargo_toml = repo_root.join("Cargo.toml");
+    // Get the absolute path of the file
+    let abs_file_path = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(file_path)
+    };
+    debug_log!("Absolute file path: {}", abs_file_path.display());
+
+    // Start from the file's directory and traverse up until we find a Cargo.toml
+    let mut current = abs_file_path.parent().unwrap_or(Path::new("/"));
+    debug_log!("Starting search from directory: {}", current.display());
+
+    // Keep track of the repository root if we find it
+    let mut repo_root: Option<PathBuf> = None;
+
+    // Traverse up until we find a directory with a Cargo.toml file or reach the filesystem root
+    while current != Path::new("") && current != Path::new("/") {
+        debug_log!("Checking directory: {}", current.display());
+
+        // Check if this directory has a Cargo.toml
+        let cargo_toml = current.join("Cargo.toml");
+        if cargo_toml.exists() {
+            debug_log!("Found Cargo.toml at: {}", cargo_toml.display());
+
+            // Check if this is a workspace root
+            let cargo_content =
+                fs::read_to_string(&cargo_toml).context("Failed to read Cargo.toml")?;
+
+            let is_workspace = cargo_content.contains("[workspace]");
+
+            if is_workspace {
+                debug_log!("This is a workspace root");
+                // Remember this as the repository root, but continue searching
+                // for a more specific crate directory
+                repo_root = Some(current.to_path_buf());
+            } else {
+                // This is a regular crate, not a workspace root
+                // Return this directory immediately
+                debug_log!("Found regular crate directory: {}", current.display());
+                return Ok(current.to_path_buf());
+            }
+        }
+
+        // Check if this directory has a .git directory (repository root)
+        if repo_root.is_none() {
+            let git_dir = current.join(".git");
+            if git_dir.exists() && git_dir.is_dir() {
+                debug_log!("Found repository root at: {}", current.display());
+                repo_root = Some(current.to_path_buf());
+            }
+        }
+
+        // Move to the parent directory
+        if let Some(parent) = current.parent() {
+            current = parent;
+        } else {
+            break;
+        }
+    }
+
+    // If we found a repository root with a workspace, try to find the specific crate
+    // that contains the file
+    if let Some(root) = repo_root {
+        let root_cargo_toml = root.join("Cargo.toml");
         if root_cargo_toml.exists() {
-            // Check if this is a workspace by looking for [workspace] in Cargo.toml
             let cargo_content =
                 fs::read_to_string(&root_cargo_toml).context("Failed to read root Cargo.toml")?;
 
             if cargo_content.contains("[workspace]") {
-                debug_log!("Workspace detected");
+                debug_log!(
+                    "Checking workspace members for file: {}",
+                    abs_file_path.display()
+                );
 
-                // For workspace, we need to find the specific crate containing the file
-                // Get the absolute path of the file
-                let abs_file_path = if file_path.is_absolute() {
-                    file_path.to_path_buf()
-                } else {
-                    std::env::current_dir()?.join(file_path)
-                };
+                // Try to find the most specific crate directory that contains the file
+                // by traversing up from the file's directory
+                let mut current = abs_file_path.parent().unwrap_or(Path::new("/"));
 
-                debug_log!("Absolute file path: {}", abs_file_path.display());
-
-                // Look for crates in subdirectories
-                for entry in WalkDir::new(&repo_root)
-                    .max_depth(3) // Limit depth to avoid excessive searching
-                    .into_iter()
-                    .filter_map(Result::ok)
-                    .filter(|e| e.file_type().is_file() && e.file_name() == "Cargo.toml")
-                {
-                    let dir = entry
-                        .path()
-                        .parent()
-                        .unwrap_or(Path::new("."))
-                        .to_path_buf();
-
-                    // Skip the root Cargo.toml
-                    if dir == repo_root {
-                        continue;
+                while current != Path::new("") && current != Path::new("/") && current != root {
+                    let cargo_toml = current.join("Cargo.toml");
+                    if cargo_toml.exists() {
+                        debug_log!("Found subcrate Cargo.toml at: {}", cargo_toml.display());
+                        return Ok(current.to_path_buf());
                     }
 
-                    // Check if the file is within this crate directory
-                    let abs_dir = if dir.is_absolute() {
-                        dir.clone()
+                    if let Some(parent) = current.parent() {
+                        current = parent;
                     } else {
-                        repo_root.join(&dir)
-                    };
-
-                    // Convert to canonical paths to handle symlinks and relative paths
-                    let canonical_file = abs_file_path.canonicalize().ok();
-                    let canonical_dir = abs_dir.canonicalize().ok();
-
-                    if let (Some(file), Some(dir)) =
-                        (canonical_file.as_ref(), canonical_dir.as_ref())
-                    {
-                        debug_log!(
-                            "Checking if {} starts with {}",
-                            file.display(),
-                            dir.display()
-                        );
-                        if file.starts_with(dir) {
-                            debug_log!("Found matching crate directory: {}", dir.display());
-                            return Ok(dir.to_path_buf());
-                        }
+                        break;
                     }
                 }
 
+                // If we couldn't find a specific crate by traversing up,
+                // return the workspace root as a fallback
                 debug_log!(
                     "No specific crate found, returning workspace root: {}",
-                    repo_root.display()
+                    root.display()
                 );
-                // If we couldn't find a specific crate, return the workspace root
-                return Ok(repo_root);
-            } else {
-                // If it's not a workspace but has a Cargo.toml, use the repository root
-                return Ok(repo_root);
+                return Ok(root);
             }
         }
+
+        // If it's not a workspace but has a repository root, return the root
+        return Ok(root);
     }
 
-    // Fallback to the original implementation if we couldn't find the repository root
-    // or if the repository root doesn't have a Cargo.toml file
-
-    // Check if the current directory has a Cargo.toml file
-    let current_dir = Path::new(".");
+    // If we couldn't find any Cargo.toml or repository root,
+    // check if the current directory has a Cargo.toml
+    let current_dir = std::env::current_dir()?;
     let current_cargo_toml = current_dir.join("Cargo.toml");
     if current_cargo_toml.exists() {
-        return Ok(current_dir.to_path_buf());
-    }
-
-    // If not, traverse up from the file's parent directory
-    let mut current = file_path.parent().unwrap_or(Path::new("."));
-
-    // Traverse up until we find a directory with a Cargo.toml file
-    while let Some(parent) = current.parent() {
-        let cargo_toml = current.join("Cargo.toml");
-        if cargo_toml.exists() {
-            return Ok(current.to_path_buf());
-        }
-
-        // Move to the parent directory
-        current = parent;
-    }
-
-    // If we couldn't find a crate directory, check if we're in a workspace
-    // and the file is in a subdirectory
-    let workspace_cargo = Path::new("Cargo.toml");
-    if workspace_cargo.exists() {
-        // Check if this is a workspace by looking for [workspace] in Cargo.toml
-        let cargo_content =
-            fs::read_to_string(workspace_cargo).context("Failed to read workspace Cargo.toml")?;
-
-        if cargo_content.contains("[workspace]") {
-            // Look for crates in subdirectories
-            for entry in WalkDir::new(".")
-                .max_depth(3) // Limit depth to avoid excessive searching
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|e| e.file_type().is_file() && e.file_name() == "Cargo.toml")
-            {
-                let dir = entry.path().parent().unwrap_or(Path::new("."));
-
-                // Skip the root Cargo.toml
-                if dir == Path::new(".") {
-                    continue;
-                }
-
-                // Get the absolute path of the file and directory
-                let abs_file_path = if file_path.is_absolute() {
-                    file_path.to_path_buf()
-                } else {
-                    std::env::current_dir()?.join(file_path)
-                };
-
-                let abs_dir = if dir.is_absolute() {
-                    dir.to_path_buf()
-                } else {
-                    std::env::current_dir()?.join(dir)
-                };
-
-                // Convert to canonical paths to handle symlinks and relative paths
-                let canonical_file = abs_file_path.canonicalize().ok();
-                let canonical_dir = abs_dir.canonicalize().ok();
-
-                if let (Some(file), Some(dir)) = (canonical_file, canonical_dir) {
-                    if file.starts_with(&dir) {
-                        return Ok(dir);
-                    }
-                }
-            }
-        }
-
-        // If it's not a workspace but has a Cargo.toml, use the current directory
-        return Ok(Path::new(".").to_path_buf());
+        debug_log!(
+            "Using current directory as crate directory: {}",
+            current_dir.display()
+        );
+        return Ok(current_dir);
     }
 
     Err(anyhow!(
